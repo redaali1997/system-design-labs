@@ -1,9 +1,9 @@
-import { Inject, Injectable, NotFoundException } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { Product } from './product.entity';
-import { REDIS_CLIENT } from 'src/redis/redis.provider';
-import Redis from 'ioredis';
+import { Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { Repository } from "typeorm";
+import { Product } from "./product.entity";
+import { REDIS_CLIENT } from "src/redis/redis.provider";
+import Redis from "ioredis";
 
 @Injectable()
 export class ProductsService {
@@ -26,7 +26,9 @@ export class ProductsService {
 
     const product = await this.productRepo.findOneBy({ id });
     if (!product) throw new NotFoundException(`Product ${id} not found`);
-    await this.redis.set(`product:${id}`, JSON.stringify(product), 'EX', 300);
+    try {
+      await this.redis.set(`product:${id}`, JSON.stringify(product), "EX", 300);
+    } catch (e) {}
     return product;
   }
 
@@ -43,7 +45,9 @@ export class ProductsService {
     if (!product) throw new NotFoundException(`Product ${id} not found`);
     product.price = price;
     await this.productRepo.save(product);
-    await this.redis.del(`product:${id}`);
+    try {
+      await this.redis.del(`product:${id}`);
+    } catch (e) {}
     return product;
   }
 }
