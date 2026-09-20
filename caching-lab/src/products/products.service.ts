@@ -5,6 +5,12 @@ import { Product } from "./product.entity";
 import { REDIS_CLIENT } from "src/redis/redis.provider";
 import Redis from "ioredis";
 
+const LOCK_TTL_MS = 3000;
+const LOCK_WAIT_RETRY_MS = 50;
+const LOCK_WAIT_MAX_RETRIES = 40; // ~2s total before giving up and reading DB directly
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 @Injectable()
 export class ProductsService {
   constructor(
@@ -15,25 +21,58 @@ export class ProductsService {
   ) {}
 
   // Backing method for GET /products/:id.
-  // No caching yet — add cache-aside here yourself.
   async findOne(id: number): Promise<Product> {
+    const cacheKey = `product:${id}`;
+
     try {
-      const cached = await this.redis.get(`product:${id}`);
+      const cached = await this.redis.get(cacheKey);
       if (cached) {
         return JSON.parse(cached);
       }
     } catch (e) {}
 
+    // Cache miss: only one caller should go fetch from MySQL and repopulate
+    // the cache. Everyone else waits for that result instead of piling onto
+    // the DB at the same time (the stampede from the k6 test).
+    const lockKey = `lock:product:${id}`;
+    let holdsLock = false;
+    try {
+      const lockResult = await this.redis.set(lockKey, "1", "PX", LOCK_TTL_MS, "NX");
+      holdsLock = lockResult === "OK";
+    } catch (e) {}
+
+    if (!holdsLock) {
+      for (let i = 0; i < LOCK_WAIT_MAX_RETRIES; i++) {
+        await sleep(LOCK_WAIT_RETRY_MS);
+        try {
+          const cached = await this.redis.get(cacheKey);
+          if (cached) return JSON.parse(cached);
+        } catch (e) {
+          break; // Redis is down — stop waiting on it, fall through to DB
+        }
+      }
+      // Lock holder never finished (crashed, slow, or Redis unavailable).
+      // Read straight from MySQL rather than waiting forever.
+    }
+
     const product = await this.productRepo.findOneBy({ id });
     if (!product) throw new NotFoundException(`Product ${id} not found`);
+
     try {
       await this.redis.set(
-        `product:${id}`,
+        cacheKey,
         JSON.stringify(product),
         "EX",
         10 + Math.floor(Math.random() * 4),
       );
     } catch (e) {}
+
+    if (holdsLock) {
+      try {
+        await this.redis.del(lockKey);
+      } catch (e) {}
+    }
+
     return product;
   }
 
