@@ -27,7 +27,12 @@ export class ProductsService {
     const product = await this.productRepo.findOneBy({ id });
     if (!product) throw new NotFoundException(`Product ${id} not found`);
     try {
-      await this.redis.set(`product:${id}`, JSON.stringify(product), "EX", 300);
+      await this.redis.set(
+        `product:${id}`,
+        JSON.stringify(product),
+        "EX",
+        10 + Math.floor(Math.random() * 4),
+      );
     } catch (e) {}
     return product;
   }
