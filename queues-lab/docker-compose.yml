@@ -1,0 +1,55 @@
+services:
+  mysql:
+    image: mysql:8
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: queues_lab
+      MYSQL_DATABASE: queues_lab
+    ports:
+      - '3308:3306'
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost', '-uroot', '-pqueues_lab']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    ports:
+      - '5672:5672'   # AMQP
+      - '15672:15672' # management UI (guest/guest)
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - '3001:3000'
+    environment:
+      PORT: 3000
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: queues_lab
+      DB_NAME: queues_lab
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      CHAOS_FAILURE_RATE: 0
+      CHAOS_DELAY_MS_MAX: 0
+    volumes:
+      - ./src:/app/src
+      - ./package.json:/app/package.json
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
