@@ -1,16 +1,17 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { ConfigService } from '@nestjs/config';
-import type { ConsumeMessage } from 'amqplib';
-import { Repository } from 'typeorm';
-import { Order } from '../orders/order.entity';
-import { PaymentEvent } from '../payment-events/payment-event.entity';
-import { PAYMENT_EVENTS_QUEUE, RabbitMQService } from './rabbitmq.service';
+import { Injectable, Logger, OnModuleInit } from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { ConfigService } from "@nestjs/config";
+import type { ConsumeMessage } from "amqplib";
+import { Repository } from "typeorm";
+import { Order } from "../orders/order.entity";
+import { PaymentEvent } from "../payment-events/payment-event.entity";
+import { PAYMENT_EVENTS_QUEUE, RabbitMQService } from "./rabbitmq.service";
+import { QueryFailedError } from "typeorm";
 
 interface PaymentEventMessage {
   providerEventId: string;
   orderId: number;
-  type: 'paid' | 'refunded' | 'failed';
+  type: "paid" | "refunded" | "failed";
   amount: number;
 }
 
@@ -32,9 +33,13 @@ export class PaymentEventsConsumer implements OnModuleInit {
 
   async onModuleInit(): Promise<void> {
     const channel = await this.rabbitMQService.getChannel();
-    await channel.consume(PAYMENT_EVENTS_QUEUE, (msg) => this.handleMessage(msg), {
-      noAck: false,
-    });
+    await channel.consume(
+      PAYMENT_EVENTS_QUEUE,
+      (msg) => this.handleMessage(msg),
+      {
+        noAck: false,
+      },
+    );
     this.logger.log(`Consuming from "${PAYMENT_EVENTS_QUEUE}"`);
   }
 
@@ -53,19 +58,29 @@ export class PaymentEventsConsumer implements OnModuleInit {
     try {
       await this.maybeInjectChaos();
 
-      // TODO (idempotency): before inserting, check whether a PaymentEvent
-      // with this providerEventId has already been processed (this needs a
-      // unique constraint on providerEventId, which doesn't exist yet) and
-      // skip + ack early if it's a duplicate.
+      try {
+        await this.paymentEvents.save(
+          this.paymentEvents.create({
+            providerEventId: payload.providerEventId,
+            orderId: payload.orderId,
+            type: payload.type,
+            processedAt: new Date(),
+          }),
+        );
+      } catch (err) {
+        const isDuplicate =
+          err instanceof QueryFailedError &&
+          (err as any).driverError?.code === "ER_DUP_ENTRY";
 
-      await this.paymentEvents.save(
-        this.paymentEvents.create({
-          providerEventId: payload.providerEventId,
-          orderId: payload.orderId,
-          type: payload.type,
-          processedAt: new Date(),
-        }),
-      );
+        if (isDuplicate) {
+          this.logger.warn(
+            `[consumer] duplicate providerEventId=${payload.providerEventId} — already processed, skipping`,
+          );
+          channel.ack(msg);
+          return;
+        }
+        throw err;
+      }
 
       // TODO (ordering / state-transition validation): verify the order's
       // current status allows this transition (e.g. don't apply "refunded"
@@ -101,15 +116,17 @@ export class PaymentEventsConsumer implements OnModuleInit {
   // via CHAOS_FAILURE_RATE (0-1) and CHAOS_DELAY_MS_MAX env vars — both 0 by
   // default, meaning this is a no-op unless you turn them on.
   private async maybeInjectChaos(): Promise<void> {
-    const failureRate = Number(this.config.get('CHAOS_FAILURE_RATE') ?? 0);
-    const maxDelayMs = Number(this.config.get('CHAOS_DELAY_MS_MAX') ?? 0);
+    const failureRate = Number(this.config.get("CHAOS_FAILURE_RATE") ?? 0);
+    const maxDelayMs = Number(this.config.get("CHAOS_DELAY_MS_MAX") ?? 0);
 
     if (maxDelayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, Math.random() * maxDelayMs));
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.random() * maxDelayMs),
+      );
     }
 
     if (failureRate > 0 && Math.random() < failureRate) {
-      throw new Error('Injected chaos failure');
+      throw new Error("Injected chaos failure");
     }
   }
 }
