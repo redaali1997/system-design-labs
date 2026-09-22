@@ -3,20 +3,29 @@ import { InjectRepository } from "@nestjs/typeorm";
 import { ConfigService } from "@nestjs/config";
 import type { ConsumeMessage } from "amqplib";
 import { Repository } from "typeorm";
-import { Order } from "../orders/order.entity";
-import { PaymentEvent } from "../payment-events/payment-event.entity";
+import { Order, OrderStatus } from "../orders/order.entity";
+import {
+  PaymentEvent,
+  PaymentEventType,
+} from "../payment-events/payment-event.entity";
 import { PAYMENT_EVENTS_QUEUE, RabbitMQService } from "./rabbitmq.service";
 import { QueryFailedError } from "typeorm";
 
 interface PaymentEventMessage {
   providerEventId: string;
   orderId: number;
-  type: "paid" | "refunded" | "failed";
+  type: PaymentEventType;
   amount: number;
 }
 
-// Deliberately naive consumer: no idempotency check, no ordering/state
-// validation, no retry/backoff, no dead-letter-exchange. Each of those is
+const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
+  pending: ["paid", "failed"],
+  paid: ["refunded"],
+  refunded: [],
+  failed: [],
+};
+
+// Deliberately naive consumer: no retry/backoff, no dead-letter-exchange. Each of those is
 // left as a TODO for you to implement yourself. On any failure it just
 // logs and drops the message (`nack` with `requeue: false`).
 @Injectable()
@@ -57,16 +66,15 @@ export class PaymentEventsConsumer implements OnModuleInit {
 
     try {
       await this.maybeInjectChaos();
-
+      let paymentEvent: PaymentEvent;
       try {
-        await this.paymentEvents.save(
-          this.paymentEvents.create({
-            providerEventId: payload.providerEventId,
-            orderId: payload.orderId,
-            type: payload.type,
-            processedAt: new Date(),
-          }),
-        );
+        paymentEvent = this.paymentEvents.create({
+          providerEventId: payload.providerEventId,
+          orderId: payload.orderId,
+          type: payload.type,
+          processedAt: null,
+        });
+        await this.paymentEvents.save(paymentEvent);
       } catch (err) {
         const isDuplicate =
           err instanceof QueryFailedError &&
@@ -82,11 +90,19 @@ export class PaymentEventsConsumer implements OnModuleInit {
         throw err;
       }
 
-      // TODO (ordering / state-transition validation): verify the order's
-      // current status allows this transition (e.g. don't apply "refunded"
-      // to an order that was never "paid") before blindly overwriting it.
+      const order = await this.orders.findOneByOrFail({ id: payload.orderId });
+      if (!ALLOWED_TRANSITIONS[order.status].includes(payload.type)) {
+        this.logger.warn(
+          `[consumer] rejected invalid transition ${order.status} -> ${payload.type} for orderId=${payload.orderId}, providerEventId=${payload.providerEventId}`,
+        );
+        channel.ack(msg);
+        return;
+      }
 
       await this.orders.update(payload.orderId, { status: payload.type });
+
+      paymentEvent.processedAt = new Date();
+      await this.paymentEvents.save(paymentEvent);
 
       this.logger.log(
         `[consumer] finished providerEventId=${payload.providerEventId} orderId=${payload.orderId} at ${new Date().toISOString()}`,
