@@ -18,11 +18,28 @@ export class RabbitMQService implements OnModuleDestroy {
   }
 
   private async connect(): Promise<void> {
-    const url = this.config.getOrThrow<string>('RABBITMQ_URL');
-    this.connection = await amqp.connect(url);
-    this.channel = await this.connection.createConfirmChannel();
-    await this.channel.assertQueue(PAYMENT_EVENTS_QUEUE, { durable: true });
-    this.logger.log(`Connected to RabbitMQ, queue "${PAYMENT_EVENTS_QUEUE}" ready`);
+    const url = this.config.getOrThrow<string>("RABBITMQ_URL");
+    const maxAttempts = 10;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        this.connection = await amqp.connect(url);
+        this.channel = await this.connection.createConfirmChannel();
+        await this.channel.assertQueue(PAYMENT_EVENTS_QUEUE, { durable: true });
+        this.logger.log(
+          `Connected to RabbitMQ, queue "${PAYMENT_EVENTS_QUEUE}" ready`,
+        );
+        return;
+      } catch (err) {
+        const delayMs = Math.min(1000 * 2 ** attempt, 10_000);
+        this.logger.warn(
+          `RabbitMQ connect attempt ${attempt}/${maxAttempts} failed: ${(err as Error).message}. Retrying in ${delayMs}ms`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    throw new Error("Could not connect to RabbitMQ after multiple attempts");
   }
 
   async onModuleDestroy(): Promise<void> {
